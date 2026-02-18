@@ -5,6 +5,7 @@ use pyo3::prelude::*;
 use std::collections::BTreeMap;
 use pythonize::pythonize;
 use std::sync::{ Arc, atomic::AtomicBool };
+use serde_json::json;
 
 use ::telemetry_parser::*;
 
@@ -72,6 +73,22 @@ impl Parser {
 
         Python::with_gil(|py| {
             Ok(pythonize(py, &imu_data)?)
+        })
+    }
+
+    fn frame_info(&self) -> PyResult<Py<PyAny>> {
+        let info = self.input.video_metadata.as_ref().map(|md| {
+            json!({
+                "fps": md.fps,
+                "width": md.width,
+                "height": md.height,
+                "duration_s": md.duration_s,
+                "rotation": md.rotation
+            })
+        });
+
+        Python::with_gil(|py| {
+            Ok(pythonize(py, &info)?)
         })
     }
 }
