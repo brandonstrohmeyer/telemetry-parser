@@ -5,6 +5,7 @@ pub mod dvtm_wm169;
 pub mod dvtm_eagle4_wa530;
 
 use std::io::*;
+use std::convert::TryInto;
 use std::sync::{ Arc, atomic::AtomicBool };
 
 use crate::tags_impl::*;
@@ -15,10 +16,96 @@ use prost::Message;
 
 mod csv;
 
+fn read_varint(data: &[u8], pos: &mut usize) -> Option<u64> {
+    let mut shift = 0;
+    let mut result: u64 = 0;
+    while *pos < data.len() {
+        let byte = data[*pos];
+        *pos += 1;
+        result |= ((byte & 0x7f) as u64) << shift;
+        if (byte & 0x80) == 0 {
+            return Some(result);
+        }
+        shift += 7;
+        if shift > 63 {
+            return None;
+        }
+    }
+    None
+}
+
+fn find_field<'a>(data: &'a [u8], target: u32) -> Option<(u8, &'a [u8])> {
+    let mut pos = 0usize;
+    while pos < data.len() {
+        let key = read_varint(data, &mut pos)?;
+        let field = (key >> 3) as u32;
+        let wtype = (key & 7) as u8;
+        let value = match wtype {
+            0 => { // varint
+                let start = pos;
+                read_varint(data, &mut pos)?;
+                &data[start..pos]
+            },
+            1 => { // 64-bit
+                let start = pos;
+                pos = pos.saturating_add(8);
+                if pos > data.len() { return None; }
+                &data[start..pos]
+            },
+            2 => { // length-delimited
+                let len = read_varint(data, &mut pos)? as usize;
+                let start = pos;
+                pos = pos.saturating_add(len);
+                if pos > data.len() { return None; }
+                &data[start..pos]
+            },
+            5 => { // 32-bit
+                let start = pos;
+                pos = pos.saturating_add(4);
+                if pos > data.len() { return None; }
+                &data[start..pos]
+            },
+            _ => return None
+        };
+        if field == target {
+            return Some((wtype, value));
+        }
+    }
+    None
+}
+
+fn get_f32_at_path(data: &[u8], path: &[u32]) -> Option<f32> {
+    let mut cur = data;
+    for (i, field) in path.iter().enumerate() {
+        let (wtype, value) = find_field(cur, *field)?;
+        let last = i + 1 == path.len();
+        if last {
+            if wtype != 5 || value.len() != 4 {
+                return None;
+            }
+            let bytes: [u8; 4] = value.try_into().ok()?;
+            return Some(f32::from_le_bytes(bytes));
+        } else {
+            if wtype != 2 {
+                return None;
+            }
+            cur = value;
+        }
+    }
+    None
+}
+
+fn parse_ac20x_accel(data: &[u8]) -> Option<(f32, f32, f32)> {
+    let x = get_f32_at_path(data, &[3, 2, 10, 2])?;
+    let y = get_f32_at_path(data, &[3, 2, 10, 3])?;
+    let z = get_f32_at_path(data, &[3, 2, 10, 4])?;
+    Some((x, y, z))
+}
+
 #[derive(Default)]
 pub struct Dji {
     pub model: Option<String>,
-    pub frame_readout_time: Option<f64>
+    pub frame_readout_time: Option<f64>,
 }
 
 #[derive(PartialEq, Debug, Clone, Copy)]
@@ -26,6 +113,7 @@ enum DeviceProtobuf {
     Unknown,
     Wm169,
     Wa530,
+    Ac20x,
 }
 
 impl Dji {
@@ -49,12 +137,12 @@ impl Dji {
         if memmem::find(buffer, b"djmd").is_some() && (memmem::find(buffer, b"DJI meta").is_some() || memmem::find(buffer, b"CAM meta").is_some()) {
             Some(Self {
                 model: None,
-                frame_readout_time: None
+                frame_readout_time: None,
             })
         } else if memmem::find(buffer, b"Clock:Tick").is_some() && memmem::find(buffer, b"IMU_ATTI(0):gyroX").is_some() {
             Some(Self {
                 model: Some("CSV flight log".into()),
-                frame_readout_time: None
+                frame_readout_time: None,
             })
         } else {
             None
@@ -91,7 +179,10 @@ impl Dji {
             }
 
             if which_proto == DeviceProtobuf::Unknown {
-                if data.len() > 64 && (memmem::find(&data[0..64], b"WA530").is_some() || memmem::find(&data[0..64], b"wa530").is_some()) {
+                let head = if data.len() > 128 { &data[0..128] } else { data };
+                if memmem::find(head, b"ac203").is_some() || memmem::find(head, b"ac204").is_some() {
+                    which_proto = DeviceProtobuf::Ac20x;
+                } else if memmem::find(head, b"WA530").is_some() || memmem::find(head, b"wa530").is_some() {
                     which_proto = DeviceProtobuf::Wa530;
                 } else {
                     which_proto = DeviceProtobuf::Wm169;
@@ -256,6 +347,21 @@ impl Dji {
                 DeviceProtobuf::Wa530 => match dvtm_eagle4_wa530::ProductMeta::decode(data) {
                     Ok(parsed) => { handle_parsed!(parsed, imu_single_attitude_after_fusion); },
                     Err(e) => { log::warn!("Failed to parse protobuf: {:?}", e); }
+                },
+                DeviceProtobuf::Ac20x => {
+                    if let Some((ax, ay, az)) = parse_ac20x_accel(data) {
+                        let mut tag_map = GroupedTagMap::new();
+                        let t = info.timestamp_ms / 1000.0;
+                        let acc = vec![TimeVector3 { t, x: ax as f64, y: ay as f64, z: az as f64 }];
+                        util::insert_tag(&mut tag_map, tag!(parsed GroupId::Accelerometer, TagId::Data, "Accelerometer data", Vec_TimeVector3_f64, |v| format!("{:?}", v), acc, vec![]), &options);
+                        util::insert_tag(&mut tag_map, tag!(parsed GroupId::Accelerometer, TagId::Unit, "Accelerometer unit", String, |v| v.to_string(), "g".into(), Vec::new()), &options);
+                        util::insert_tag(&mut tag_map, tag!(parsed GroupId::Accelerometer, TagId::Orientation, "IMU orientation", String, |v| v.to_string(), "XYZ".into(), Vec::new()), &options);
+                        info.tag_map = Some(tag_map);
+                        samples.push(info);
+                        if options.probe_only {
+                            cancel_flag2.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
                 },
             }
         }, cancel_flag)?;
