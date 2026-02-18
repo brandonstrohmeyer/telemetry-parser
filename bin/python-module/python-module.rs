@@ -74,6 +74,13 @@ impl Parser {
             Ok(pythonize(py, &imu_data)?)
         })
     }
+
+    fn frame_info(&self) -> PyResult<Py<PyAny>> {
+        let info = self.input.frame_info();
+        Python::with_gil(|py| {
+            Ok(pythonize(py, &info)?)
+        })
+    }
 }
 
 #[pymodule]

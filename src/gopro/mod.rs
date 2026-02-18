@@ -17,6 +17,7 @@ pub struct GoPro {
     pub model: Option<String>,
     extra_gpmf: Option<GroupedTagMap>,
     frame_readout_time: Option<f64>,
+    frame_info: Option<FrameInfo>,
     has_cori: bool,
     is_raw_gpmf: bool,
 }
@@ -33,6 +34,9 @@ impl GoPro {
     }
     pub fn frame_readout_time(&self) -> Option<f64> {
         self.frame_readout_time
+    }
+    pub fn frame_info(&self) -> Option<FrameInfo> {
+        self.frame_info.clone()
     }
     pub fn normalize_imu_orientation(v: String) -> String {
         v
@@ -115,6 +119,9 @@ impl GoPro {
                     let res = GoPro::parse_metadata(&chunk[8..next], GroupId::Default, false, &options);
                     if let Ok(mut map) = res {
                         self.process_map(&mut map);
+                        if let Some(ref frame_info) = self.frame_info {
+                            Self::insert_frameinfo_tags(&mut map, frame_info, &options);
+                        }
                         samples.push(SampleInfo { tag_map: Some(map), ..Default::default() });
                         if options.probe_only {
                             break;
@@ -124,13 +131,27 @@ impl GoPro {
             }
         } else {
             let cancel_flag2 = cancel_flag.clone();
-            let ctx = util::get_metadata_track_samples(stream, size, true, |mut info: SampleInfo, data: &[u8], file_position: u64, _video_md: Option<&VideoMetadata>| {
+            let ctx = util::get_metadata_track_samples(stream, size, true, |mut info: SampleInfo, data: &[u8], file_position: u64, video_md: Option<&VideoMetadata>| {
                 if size > 0 {
                     progress_cb(file_position as f64 / size as f64);
                 }
                 if Self::detect_metadata(data) {
                     if let Ok(mut map) = GoPro::parse_metadata(&data[8..], GroupId::Default, false, &options) {
                         self.process_map(&mut map);
+                        if self.frame_info.is_none() {
+                            if let Some(md) = video_md {
+                                if md.width > 0 && md.height > 0 && md.fps > 0.0 {
+                                    self.frame_info = Some(FrameInfo {
+                                        width: md.width,
+                                        height: md.height,
+                                        fps: md.fps,
+                                    });
+                                }
+                            }
+                        }
+                        if let Some(ref frame_info) = self.frame_info {
+                            Self::insert_frameinfo_tags(&mut map, frame_info, &options);
+                        }
                         info.tag_map = Some(map);
                         samples.push(info);
                     }
@@ -144,6 +165,19 @@ impl GoPro {
             }
         }
         self.process_samples(&mut samples, fps, &options);
+        if let Some(ref frame_info) = self.frame_info {
+            for sample in samples.iter_mut() {
+                if let Some(ref mut map) = sample.tag_map {
+                    let has_frameinfo = map
+                        .get(&GroupId::Default)
+                        .map(|group| group.contains_key(&TagId::Custom("FrameInfo".into())))
+                        .unwrap_or(false);
+                    if !has_frameinfo {
+                        Self::insert_frameinfo_tags(map, frame_info, &options);
+                    }
+                }
+            }
+        }
 
         if self.model.as_ref().map(|x| x.contains("HERO5")).unwrap_or_default() {
             if samples.is_empty() {
@@ -278,6 +312,19 @@ impl GoPro {
                     v.insert(TagId::Orientation, crate::tag!(parsed g.clone(), TagId::Orientation, "IMUO", String, |v| v.to_string(), o, Vec::new()));
                 }
             }
+        }
+    }
+
+    fn insert_frameinfo_tags(
+        tag_map: &mut GroupedTagMap,
+        frame_info: &FrameInfo,
+        options: &crate::InputOptions,
+    ) {
+        let frame_json = serde_json::to_value(frame_info)
+            .unwrap_or(serde_json::Value::Null);
+        util::insert_tag(tag_map, tag!(parsed GroupId::Default, TagId::Custom("FrameInfo".into()), "Frame info", Json, |v| serde_json::to_string(v).unwrap(), frame_json, vec![]), options);
+        if frame_info.fps > 0.0 {
+            util::insert_tag(tag_map, tag!(parsed GroupId::Default, TagId::FrameRate, "Frame rate", f64, |v| format!("{:.3}", v), frame_info.fps, vec![]), options);
         }
     }
 

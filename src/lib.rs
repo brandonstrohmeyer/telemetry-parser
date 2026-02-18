@@ -33,6 +33,13 @@ use std::sync::{ Arc, atomic::AtomicBool };
 use std::collections::HashSet;
 use util::*;
 
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct FrameInfo {
+    pub width: usize,
+    pub height: usize,
+    pub fps: f64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum TagFilter {
     EntireGroup(tags_impl::GroupId),
@@ -170,4 +177,14 @@ impl_formats! {
     Cooke     => cooke::Cooke,
     SenseFlow => senseflow::SenseFlow,
     Freefly   => freefly::Freefly,
+}
+
+impl Input {
+    pub fn frame_info(&self) -> Option<FrameInfo> {
+        match &self.inner {
+            SupportedFormats::GoPro(x) => x.frame_info(),
+            SupportedFormats::Dji(x) => x.frame_info(),
+            _ => None,
+        }
+    }
 }

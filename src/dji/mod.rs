@@ -10,6 +10,7 @@ use std::sync::{ Arc, atomic::AtomicBool };
 use crate::tags_impl::*;
 use crate::*;
 use crate::util::insert_tag;
+use crate::FrameInfo;
 use memchr::memmem;
 use prost::Message;
 
@@ -18,7 +19,8 @@ mod csv;
 #[derive(Default)]
 pub struct Dji {
     pub model: Option<String>,
-    pub frame_readout_time: Option<f64>
+    pub frame_readout_time: Option<f64>,
+    pub frame_info: Option<FrameInfo>,
 }
 
 #[derive(PartialEq, Debug, Clone, Copy)]
@@ -31,6 +33,9 @@ enum DeviceProtobuf {
 impl Dji {
     pub fn camera_type(&self) -> String {
         "DJI".to_owned()
+    }
+    pub fn frame_info(&self) -> Option<FrameInfo> {
+        self.frame_info.clone()
     }
     pub fn has_accurate_timestamps(&self) -> bool {
         true
@@ -49,12 +54,14 @@ impl Dji {
         if memmem::find(buffer, b"djmd").is_some() && (memmem::find(buffer, b"DJI meta").is_some() || memmem::find(buffer, b"CAM meta").is_some()) {
             Some(Self {
                 model: None,
-                frame_readout_time: None
+                frame_readout_time: None,
+                frame_info: None,
             })
         } else if memmem::find(buffer, b"Clock:Tick").is_some() && memmem::find(buffer, b"IMU_ATTI(0):gyroX").is_some() {
             Some(Self {
                 model: Some("CSV flight log".into()),
-                frame_readout_time: None
+                frame_readout_time: None,
+                frame_info: None,
             })
         } else {
             None
@@ -73,6 +80,7 @@ impl Dji {
         let mut distortion_coeffs = None;
         let mut exposure_time = 0.0;
         let mut fps = 59.94;
+        let mut fps_from_meta: Option<f64> = None;
         let mut sensor_fps = 59.969295501708984;
         let mut sample_rate = 2000.0;
         // let mut global_quat_i = 0;
@@ -85,7 +93,7 @@ impl Dji {
         let mut which_proto = DeviceProtobuf::Unknown;
 
         let cancel_flag2 = cancel_flag.clone();
-        let ctx = util::get_metadata_track_samples(stream, size, true, |mut info: SampleInfo, data: &[u8], file_position: u64, _video_md: Option<&VideoMetadata>| {
+        let ctx = util::get_metadata_track_samples(stream, size, true, |mut info: SampleInfo, data: &[u8], file_position: u64, video_md: Option<&VideoMetadata>| {
             if size > 0 {
                 progress_cb(file_position as f64 / size as f64);
             }
@@ -124,11 +132,38 @@ impl Dji {
                         if let Some(ref stream) = $parsed.stream_meta {
                             if let Some(ref meta) = stream.video_stream_meta {
                                 fps = meta.framerate as f64;
+                                fps_from_meta = if fps > 0.0 { Some(fps) } else { None };
+                                let w = meta.resolution_width as usize;
+                                let h = meta.resolution_height as usize;
+                                if w > 0 && h > 0 && fps > 0.0 {
+                                    self.frame_info = Some(FrameInfo { width: w, height: h, fps });
+                                }
                             }
                         }
                         if let Some(ref mut v) = self.frame_readout_time {
                             *v /= fps / sensor_fps;
                         }
+                    }
+
+                    if self.frame_info.is_none() {
+                        if let Some(md) = video_md {
+                            let fps_val = fps_from_meta
+                                .filter(|v| *v > 0.0)
+                                .or_else(|| if md.fps > 0.0 { Some(md.fps) } else { None });
+                            if let Some(fps_val) = fps_val {
+                                if md.width > 0 && md.height > 0 {
+                                    self.frame_info = Some(FrameInfo {
+                                        width: md.width,
+                                        height: md.height,
+                                        fps: fps_val,
+                                    });
+                                }
+                            }
+                        }
+                    }
+
+                    if let Some(ref frame_info) = self.frame_info {
+                        Self::insert_frameinfo_tags(&mut tag_map, frame_info, &options);
                     }
 
                     let fps_ratio = fps / sensor_fps;
@@ -275,6 +310,19 @@ impl Dji {
         }
 
         Ok(samples)
+    }
+
+    fn insert_frameinfo_tags(
+        tag_map: &mut GroupedTagMap,
+        frame_info: &FrameInfo,
+        options: &crate::InputOptions,
+    ) {
+        let frame_json = serde_json::to_value(frame_info)
+            .unwrap_or(serde_json::Value::Null);
+        insert_tag(tag_map, tag!(parsed GroupId::Default, TagId::Custom("FrameInfo".into()), "Frame info", Json, |v| serde_json::to_string(v).unwrap(), frame_json, vec![]), options);
+        if frame_info.fps > 0.0 {
+            insert_tag(tag_map, tag!(parsed GroupId::Default, TagId::FrameRate, "Frame rate", f64, |v| format!("{:.3}", v), frame_info.fps, vec![]), options);
+        }
     }
 
     fn get_lens_profile(&self, width: u32, height: u32, focal_length: f64, coeffs: &[f32]) -> serde_json::Value {
