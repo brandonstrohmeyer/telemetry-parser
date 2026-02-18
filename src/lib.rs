@@ -61,7 +61,8 @@ macro_rules! impl_formats {
         }
         pub struct Input {
             inner: SupportedFormats,
-            pub samples: Option<Vec<SampleInfo>>
+            pub samples: Option<Vec<SampleInfo>>,
+            pub video_metadata: Option<VideoMetadata>,
         }
         impl Input {
             pub fn from_stream<T: Read + Seek, P: AsRef<std::path::Path>, F: Fn(f64)>(stream: &mut T, size: usize, filepath: P, progress_cb: F, cancel_flag: Arc<AtomicBool>) -> Result<Input> {
@@ -83,6 +84,8 @@ macro_rules! impl_formats {
                 if buf.is_empty() {
                     return Err(Error::new(ErrorKind::Other, "File is empty or there was an error trying to load it."));
                 }
+                let video_metadata = util::get_video_metadata(stream, size).ok();
+                stream.seek(SeekFrom::Start(0))?;
                 let ext = Some(filesystem::get_extension(filepath.as_ref().to_str().unwrap_or_default()).to_ascii_lowercase()).filter(|x| !x.is_empty());
                 {$(
                     let exts = <$class>::possible_extensions();
@@ -96,7 +99,8 @@ macro_rules! impl_formats {
                         if let Some(mut x) = <$class>::detect(&buf, &filepath, &options) {
                             return Ok(Input {
                                 samples: x.parse(stream, size, progress_cb, cancel_flag, options).ok(),
-                                inner: SupportedFormats::$name(x)
+                                inner: SupportedFormats::$name(x),
+                                video_metadata: video_metadata.clone(),
                             });
                         }
                     }
@@ -108,7 +112,9 @@ macro_rules! impl_formats {
                         for try_ext in ["gcsv", "bbl", "bfl", "csv", "GCSV", "BBL", "BFL", "CSV"] {
                             if let Some(gyro_path) = filepath.as_ref().to_str().and_then(|x| filesystem::file_with_extension(x, try_ext)) {
                                 if let Ok(mut f) = filesystem::open_file(&fs, &gyro_path) {
-                                    return Self::from_stream(&mut f.file, f.size, &gyro_path, progress_cb, cancel_flag);
+                                    let mut input = Self::from_stream(&mut f.file, f.size, &gyro_path, progress_cb, cancel_flag)?;
+                                    input.video_metadata = video_metadata.clone();
+                                    return Ok(input);
                                 }
                             }
                         }
