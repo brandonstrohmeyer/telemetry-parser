@@ -3,4 +3,6 @@ target/
 dev/
 .env*/
 *.code-workspace
-publish.sh
+publish.sh# ignore python build artifacts
+bin/python-module/dist/
+*.whl
